@@ -1,0 +1,93 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cloudops-cluster
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Log in to Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get image tag
+        id: image-tag
+        run: echo "tag=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Deploy Frontend
+        run: |
+          kubectl set image deployment/cloudops-frontend \
+            frontend=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend:${{ steps.image-tag.outputs.tag }} \
+            -n cloudops
+
+          kubectl rollout status deployment/cloudops-frontend -n cloudops --timeout=300s
+
+      - name: Deploy Backend
+        run: |
+          kubectl set image deployment/cloudops-backend \
+            backend=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend:${{ steps.image-tag.outputs.tag }} \
+            -n cloudops
+
+          kubectl rollout status deployment/cloudops-backend -n cloudops --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "Checking service health..."
+          kubectl get pods -n cloudops
+          kubectl get services -n cloudops
+
+          BACKEND_POD=$(kubectl get pods -n cloudops -l app=cloudops-backend -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n cloudops $BACKEND_POD -- curl -s http://localhost:4000/health
+
+      - name: Notify on success
+        if: success()
+        run: |
+          echo "Deployment to ${{ github.event.inputs.environment }} completed successfully!"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Deployment failed, initiating rollback..."
+          kubectl rollout undo deployment/cloudops-frontend -n cloudops
+          kubectl rollout undo deployment/cloudops-backend -n cloudops
+          echo "Rollback completed"
